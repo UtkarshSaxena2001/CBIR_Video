@@ -16,64 +16,81 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 model = YOLO(MODEL_PATH)
 
-for video_name in os.listdir(FRAMES_DIR):
-    video_path = os.path.join(FRAMES_DIR, video_name)
-    iframe_dir = os.path.join(video_path, "I")
+# walk through class folders
+for class_name in os.listdir(FRAMES_DIR):
 
-    if not os.path.isdir(iframe_dir):
+    class_path = os.path.join(FRAMES_DIR, class_name)
+
+    if not os.path.isdir(class_path):
         continue
 
-    print(f"\n▶ Running YOLO on I-frames of {video_name}")
+    print(f"\n=== CLASS: {class_name} ===")
 
-    out_video_dir = os.path.join(OUTPUT_DIR, video_name)
-    person_dir = os.path.join(out_video_dir, "persons")
-    os.makedirs(person_dir, exist_ok=True)
+    for video_name in os.listdir(class_path):
 
-    metadata_file = os.path.join(out_video_dir, "metadata.csv")
+        video_path = os.path.join(class_path, video_name)
+        iframe_dir = os.path.join(video_path, "I")
 
-    with open(metadata_file, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "video",
-            "frame",
-            "person_id",
-            "x1", "y1", "x2", "y2",
-            "confidence"
-        ])
+        if not os.path.isdir(iframe_dir):
+            continue
 
-        for frame_name in tqdm(sorted(os.listdir(iframe_dir))):
-            if not frame_name.endswith(".jpg"):
-                continue
+        print(f"▶ Running YOLO on I-frames of {video_name}")
 
-            frame_path = os.path.join(iframe_dir, frame_name)
-            img = cv2.imread(frame_path)
+        # preserve class structure in output
+        out_video_dir = os.path.join(OUTPUT_DIR, class_name, video_name)
+        person_dir = os.path.join(out_video_dir, "persons")
 
-            if img is None:
-                continue
+        os.makedirs(person_dir, exist_ok=True)
 
-            results = model(img, conf=CONF_THRES, iou=IOU_THRES)[0]
+        metadata_file = os.path.join(out_video_dir, "metadata.csv")
 
-            for pid, box in enumerate(results.boxes):
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                conf = float(box.conf[0])
+        with open(metadata_file, "w", newline="") as f:
 
-                # safety check
-                if x2 <= x1 or y2 <= y1:
+            writer = csv.writer(f)
+            writer.writerow([
+                "class",
+                "video",
+                "frame",
+                "person_id",
+                "x1", "y1", "x2", "y2",
+                "confidence"
+            ])
+
+            for frame_name in tqdm(sorted(os.listdir(iframe_dir)), desc="Detecting"):
+
+                if not frame_name.endswith(".jpg"):
                     continue
 
-                crop = img[y1:y2, x1:x2]
-                if crop.size == 0:
+                frame_path = os.path.join(iframe_dir, frame_name)
+                img = cv2.imread(frame_path)
+
+                if img is None:
                     continue
 
-                crop_name = f"{frame_name[:-4]}_p{pid}.jpg"
-                cv2.imwrite(os.path.join(person_dir, crop_name), crop)
+                results = model(img, conf=CONF_THRES, iou=IOU_THRES)[0]
 
-                writer.writerow([
-                    video_name,
-                    frame_name,
-                    pid,
-                    x1, y1, x2, y2,
-                    conf
-                ])
+                for pid, box in enumerate(results.boxes):
 
-    print(f"✅ Finished {video_name}")
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    conf = float(box.conf[0])
+
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+
+                    crop = img[y1:y2, x1:x2]
+                    if crop.size == 0:
+                        continue
+
+                    crop_name = f"{frame_name[:-4]}_p{pid}.jpg"
+                    cv2.imwrite(os.path.join(person_dir, crop_name), crop)
+
+                    writer.writerow([
+                        class_name,
+                        video_name,
+                        frame_name,
+                        pid,
+                        x1, y1, x2, y2,
+                        conf
+                    ])
+
+        print(f"Finished {video_name}")
