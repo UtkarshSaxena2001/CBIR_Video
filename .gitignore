@@ -5,4 +5,4 @@ runs/
 KTH_full/
 Frames/
 Yolo_Output/
-features.npy
+Features/
