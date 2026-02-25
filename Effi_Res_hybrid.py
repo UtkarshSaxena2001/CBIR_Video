@@ -1,22 +1,5 @@
 import tensorflow as tf
-from keras import layers, models
-
-
-def inception_block(x, filters):
-    branch1x1 = layers.Conv2D(filters, (1, 1), padding='same', activation='relu')(x)
-
-    branch3x3 = layers.Conv2D(filters, (1, 1), padding='same', activation='relu')(x)
-    branch3x3 = layers.Conv2D(filters, (3, 3), padding='same', activation='relu')(branch3x3)
-
-    branch5x5 = layers.Conv2D(filters, (1, 1), padding='same', activation='relu')(x)
-    branch5x5 = layers.Conv2D(filters, (5, 5), padding='same', activation='relu')(branch5x5)
-
-    branch_pool = layers.MaxPooling2D((3, 3), strides=(1, 1), padding='same')(x)
-    branch_pool = layers.Conv2D(filters, (1, 1), padding='same', activation='relu')(branch_pool)
-
-    x = layers.concatenate([branch1x1, branch3x3, branch5x5, branch_pool], axis=-1)
-    x = layers.BatchNormalization()(x)
-    return x
+from keras import layers, models #type: ignore
 
 
 def mbconv_block(x, filters, kernel_size, strides=(1, 1), expand_ratio=6):
@@ -59,6 +42,12 @@ def residual_block(x, filters, strides=(1, 1)):
     return x
 
 
+def stage_block(x, filters, mbconv_stride, expand_ratio):
+    x = mbconv_block(x, filters, (3, 3), strides=mbconv_stride, expand_ratio=expand_ratio)
+    x = residual_block(x, filters, strides=(1, 1))
+    return x
+
+
 def build_feature_extractor(input_shape=(224, 224, 3), feature_dim=512):
     inputs = layers.Input(shape=input_shape)
 
@@ -67,20 +56,15 @@ def build_feature_extractor(input_shape=(224, 224, 3), feature_dim=512):
     x = layers.BatchNormalization()(x)
     x = layers.ReLU()(x)
 
-    # Stage 1 (no downsample): MBConv -> Res -> Inception
-    x = mbconv_block(x, 64, (3, 3), strides=(1, 1), expand_ratio=1)
-    x = residual_block(x, 64, strides=(1, 1))
-    x = inception_block(x, 32)
-
-    # Stage 2 (downsample): MBConv -> Res -> Inception
-    x = mbconv_block(x, 128, (3, 3), strides=(2, 2), expand_ratio=6)
-    x = residual_block(x, 128, strides=(1, 1))
-    x = inception_block(x, 64)
-
-    # Stage 3 (downsample): MBConv -> Res -> Inception
-    x = mbconv_block(x, 256, (3, 3), strides=(2, 2), expand_ratio=6)
-    x = residual_block(x, 256, strides=(1, 1))
-    x = inception_block(x, 128)
+    # EfficientNet + ResNet hybrid stages
+    # Stage 1: keep resolution
+    x = stage_block(x, filters=64, mbconv_stride=(1, 1), expand_ratio=1)
+    # Stage 2: downsample
+    x = stage_block(x, filters=128, mbconv_stride=(2, 2), expand_ratio=6)
+    # Stage 3: downsample
+    x = stage_block(x, filters=256, mbconv_stride=(2, 2), expand_ratio=6)
+    # Stage 4: downsample
+    x = stage_block(x, filters=512, mbconv_stride=(2, 2), expand_ratio=6)
 
     # Feature head
     x = layers.GlobalAveragePooling2D()(x)
