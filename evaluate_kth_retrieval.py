@@ -2,9 +2,10 @@ import argparse
 import os
 from typing import List, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
-from keras.utils import load_img, img_to_array
+from keras.utils import img_to_array, load_img #type: ignore
 
 from Effi_Res_hybrid import build_feature_extractor
 
@@ -153,6 +154,100 @@ def compute_metrics(features: np.ndarray, labels: List[str], top_k: int) -> dict
     }
 
 
+def compute_precision_recall_vs_k(
+    features: np.ndarray,
+    labels: List[str],
+    max_k: int,
+) -> Tuple[List[int], List[float], List[float]]:
+    labels = np.asarray(labels)
+    feats = l2_normalize(features)
+    sim = np.dot(feats, feats.T)
+    n = len(labels)
+    if n <= 1:
+        return [], [], []
+
+    if max_k <= 0:
+        max_k = n - 1
+    max_k = max(1, min(max_k, n - 1))
+    ks = list(range(1, max_k + 1))
+    precision_curve = []
+    recall_curve = []
+
+    for k in ks:
+        precisions = []
+        recalls = []
+        for i in range(n):
+            scores = sim[i].copy()
+            scores[i] = -np.inf
+
+            ranked_idx = np.argsort(scores)[::-1]
+            ranked_labels = labels[ranked_idx]
+            relevances = (ranked_labels == labels[i]).astype(np.int32)
+
+            topk_rel = relevances[:k]
+            hits = int(topk_rel.sum())
+            total_relevant = int((labels == labels[i]).sum() - 1)
+
+            precision = hits / k if k > 0 else 0.0
+            recall = hits / total_relevant if total_relevant > 0 else 0.0
+            precisions.append(precision)
+            recalls.append(recall)
+
+        precision_curve.append(float(np.mean(precisions)))
+        recall_curve.append(float(np.mean(recalls)))
+
+    return ks, precision_curve, recall_curve
+
+
+def plot_precision_recall_vs_k(
+    ks: List[int],
+    precision_curve: List[float],
+    recall_curve: List[float],
+    output_path: str,
+) -> None:
+    if not ks:
+        return
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    plt.figure(figsize=(9, 5))
+    plt.plot(ks, precision_curve, marker="o", linewidth=2, label="Precision@K")
+    plt.plot(ks, recall_curve, marker="s", linewidth=2, label="Recall@K")
+    plt.xlabel("K (number of retrieved items)")
+    plt.ylabel("Score")
+    plt.title("Precision and Recall vs K")
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+
+
+def plot_precision_vs_recall(
+    recall_curve: List[float],
+    precision_curve: List[float],
+    output_path: str,
+) -> None:
+    if not recall_curve or not precision_curve:
+        return
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    plt.figure(figsize=(6, 6))
+    plt.plot(recall_curve, precision_curve, marker="o", linewidth=2)
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Precision-Recall Curve")
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="KTH retrieval evaluation with cosine similarity")
     parser.add_argument("--frames-dir", default="Frames", help="Frame root with class/video/I or P folders")
@@ -161,6 +256,22 @@ def main():
     parser.add_argument("--batch-size", default=16, type=int, help="Batch size for feature extraction")
     parser.add_argument("--feature-dim", default=512, type=int, help="Feature dimension in head")
     parser.add_argument("--top-k", default=5, type=int, help="Top-K for precision/recall/F1")
+    parser.add_argument(
+        "--max-k-curve",
+        default=0,
+        type=int,
+        help="Maximum K for precision/recall curve; use 0 for full range (N-1)",
+    )
+    parser.add_argument(
+        "--curve-path",
+        default="Features/precision_recall_vs_k.png",
+        help="Output path for precision/recall-vs-K plot",
+    )
+    parser.add_argument(
+        "--pr-curve-path",
+        default="Features/precision_vs_recall.png",
+        help="Output path for precision-vs-recall plot",
+    )
     parser.add_argument("--cache-dir", default="Features", help="Cache directory for features")
     parser.add_argument("--force", action="store_true", help="Recompute features even if cache exists")
     args = parser.parse_args()
@@ -202,6 +313,11 @@ def main():
         np.save(path_path, np.asarray(video_dirs))
 
     metrics = compute_metrics(features, labels, top_k=args.top_k)
+    ks, precision_curve, recall_curve = compute_precision_recall_vs_k(
+        features, labels, max_k=args.max_k_curve
+    )
+    plot_precision_recall_vs_k(ks, precision_curve, recall_curve, args.curve_path)
+    plot_precision_vs_recall(recall_curve, precision_curve, args.pr_curve_path)
 
     print("KTH Retrieval Metrics")
     print(f"Videos: {len(labels)}")
@@ -209,6 +325,8 @@ def main():
     print(f"Recall@{args.top_k}: {metrics['recall@k']:.4f}")
     print(f"F1@{args.top_k}: {metrics['f1@k']:.4f}")
     print(f"mAP: {metrics['mAP']:.4f}")
+    print(f"Precision/Recall vs K plot saved to: {args.curve_path}")
+    print(f"Precision vs Recall plot saved to: {args.pr_curve_path}")
 
 
 if __name__ == "__main__":
