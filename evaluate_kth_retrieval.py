@@ -1,15 +1,18 @@
 import argparse
 import os
 from typing import Any, List, Optional, Tuple
-
 import cv2 #type: ignore
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 from keras.utils import img_to_array, load_img #type: ignore
 from tqdm import tqdm #type: ignore
-
+from keras.applications.efficientnet import preprocess_input as effnet_preprocess #type: ignore
 from Effi_Res_hybrid import build_feature_extractor
+
+
+MODEL_TAG = "effb4_incepres_lstm5"
+PREPROCESS_TAG = "effnet_tf_preprocess"
 
 
 def list_videos_from_frames(frames_dir: str) -> Tuple[List[str], List[str]]:
@@ -118,8 +121,8 @@ def load_batch(frame_paths: List[str], img_size: Tuple[int, int]) -> np.ndarray:
         arr = img_to_array(img)
         batch.append(arr)
     batch = np.asarray(batch, dtype=np.float32)
-    batch = batch / 255.0
-    return batch
+    # Standard preprocessing for EfficientNet/InceptionResNetV2 (scales to [-1, 1])
+    return effnet_preprocess(batch)
 
 
 def extract_video_features(
@@ -407,6 +410,35 @@ def plot_precision_recall_vs_k(
     plt.close()
 
 
+def plot_f1_vs_k(
+    ks: List[int],
+    precision_curve: List[float],
+    recall_curve: List[float],
+    output_path: str,
+) -> None:
+    if not ks:
+        return
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    p = np.asarray(precision_curve, dtype=np.float32)
+    r = np.asarray(recall_curve, dtype=np.float32)
+    f1 = (2.0 * p * r) / np.maximum(p + r, 1e-10)
+
+    plt.figure(figsize=(9, 5))
+    plt.plot(ks, f1.tolist(), marker="^", linewidth=2, label="F1@K")
+    plt.xlabel("K (number of retrieved items)")
+    plt.ylabel("F1")
+    plt.title("F1 vs K")
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+
+
 def plot_precision_vs_recall(
     recall_curve: List[float],
     precision_curve: List[float],
@@ -430,12 +462,93 @@ def plot_precision_vs_recall(
     plt.close()
 
 
+def plot_weight_search_history(
+    scores: List[float],
+    best_scores: List[float],
+    output_path: str,
+) -> None:
+    if not scores:
+        return
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    iters = list(range(1, len(scores) + 1))
+    plt.figure(figsize=(9, 5))
+    plt.plot(iters, scores, linewidth=1.5, alpha=0.7, label="Iteration score")
+    plt.plot(iters, best_scores, linewidth=2.5, label="Best-so-far score")
+    plt.xlabel("Iteration")
+    plt.ylabel("Score")
+    plt.title("Fusion Weight Search History")
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+
+
+def optimize_fusion_weights(
+    f_cnn: np.ndarray,
+    f_dtcwt: np.ndarray,
+    f_dna: np.ndarray,
+    labels: List[str],
+    top_k: int,
+    num_samples: int,
+    seed: int,
+    target_metric: str,
+    fixed_weights: Optional[Tuple[float, float, float]] = None,
+) -> Tuple[np.ndarray, Tuple[float, float, float], dict, dict]:
+    if fixed_weights is not None:
+        fused = weighted_fuse_features(
+            f_cnn, f_dtcwt, f_dna, fixed_weights[0], fixed_weights[1], fixed_weights[2]
+        )
+        metrics = compute_metrics(fused, labels, top_k=top_k)
+        history = {
+            "scores": [float(metrics[target_metric])],
+            "best_scores": [float(metrics[target_metric])],
+            "weights": [tuple(np.asarray(fixed_weights, dtype=np.float32) / np.sum(fixed_weights))],
+        }
+        return fused, history["weights"][0], metrics, history
+
+    rng = np.random.default_rng(seed)
+    best_score = -np.inf
+    best_weights: Tuple[float, float, float] = (1.0, 0.0, 0.0)
+    best_metrics: Optional[dict] = None
+    best_fused: Optional[np.ndarray] = None
+    scores: List[float] = []
+    best_scores: List[float] = []
+    weight_list: List[Tuple[float, float, float]] = []
+
+    for _ in range(num_samples):
+        w = rng.dirichlet(np.ones(3, dtype=np.float32))
+        weights = (float(w[0]), float(w[1]), float(w[2]))
+        fused = weighted_fuse_features(f_cnn, f_dtcwt, f_dna, weights[0], weights[1], weights[2])
+        metrics = compute_metrics(fused, labels, top_k=top_k)
+        score = float(metrics[target_metric])
+        scores.append(score)
+        weight_list.append(weights)
+
+        if score > best_score:
+            best_score = score
+            best_weights = weights
+            best_metrics = metrics
+            best_fused = fused
+        best_scores.append(best_score)
+
+    if best_metrics is None or best_fused is None:
+        raise RuntimeError("Fusion weight search failed to produce a valid candidate.")
+
+    history = {"scores": scores, "best_scores": best_scores, "weights": weight_list}
+    return best_fused, best_weights, best_metrics, history
+
+
 def main():
     parser = argparse.ArgumentParser(description="KTH retrieval evaluation with cosine similarity")
     parser.add_argument("--frames-dir", default="Frames", help="Frame root with class/video/I or P folders")
     parser.add_argument("--input-size", default=224, type=int, help="Input image size")
     parser.add_argument("--frames-per-video", default=10, type=int, help="Sampled frames per video")
-    parser.add_argument("--batch-size", default=16, type=int, help="Batch size for feature extraction")
+    parser.add_argument("--batch-size", default=4, type=int, help="Batch size for feature extraction")
     parser.add_argument("--feature-dim", default=512, type=int, help="Feature dimension in head")
     parser.add_argument("--top-k", default=5, type=int, help="Top-K for precision/recall/F1")
     parser.add_argument(
@@ -462,6 +575,20 @@ def main():
     parser.add_argument("--w-dtcwt", default=0.33, type=float, help="Fusion weight for DTCWT features")
     parser.add_argument("--w-dna", default=0.33, type=float, help="Fusion weight for DNA features")
     parser.add_argument(
+        "--optimize-fusion",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Search multiple fusion weight combinations and report the best iteration",
+    )
+    parser.add_argument("--fusion-iters", default=200, type=int, help="Number of random fusion weight samples")
+    parser.add_argument(
+        "--fusion-target",
+        default="mAP",
+        choices=["mAP", "f1@k", "precision@k", "recall@k"],
+        help="Metric to maximize when selecting best fusion weights",
+    )
+    parser.add_argument("--fusion-seed", default=42, type=int, help="Random seed for fusion weight search")
+    parser.add_argument(
         "--max-k-curve",
         default=0,
         type=int,
@@ -477,19 +604,31 @@ def main():
         default="Features/precision_vs_recall.png",
         help="Output path for precision-vs-recall plot",
     )
+    parser.add_argument(
+        "--f1-curve-path",
+        default="Features/f1_vs_k.png",
+        help="Output path for F1-vs-K plot",
+    )
+    parser.add_argument(
+        "--fusion-history-path",
+        default="Features/fusion_search_history.png",
+        help="Output path for fusion weight search history plot",
+    )
     parser.add_argument("--cache-dir", default="Features", help="Cache directory for features")
     parser.add_argument("--force", action="store_true", help="Recompute features even if cache exists")
     args = parser.parse_args()
 
     os.makedirs(args.cache_dir, exist_ok=True)
-    cache_tag = "person" if args.person_only else "all"
+    cache_tag = f"{'person' if args.person_only else 'all'}_{MODEL_TAG}_{PREPROCESS_TAG}"
     feat_path = os.path.join(args.cache_dir, f"kth_features_{cache_tag}.npy")
     dtcwt_path = os.path.join(args.cache_dir, f"kth_dtcwt_{cache_tag}.npy")
     dna_path = os.path.join(args.cache_dir, f"kth_dna_{cache_tag}.npy")
     label_path = os.path.join(args.cache_dir, f"kth_labels_{cache_tag}.npy")
     path_path = os.path.join(args.cache_dir, f"kth_paths_{cache_tag}.npy")
 
-    cache_ok = (not args.force) and os.path.exists(feat_path) and os.path.exists(label_path) and os.path.exists(path_path)
+    # Default to recompute on IDE runs to avoid stale features when changing architectures.
+    force_recompute = True if not hasattr(args, "force") else bool(args.force)
+    cache_ok = (not force_recompute) and os.path.exists(feat_path) and os.path.exists(label_path) and os.path.exists(path_path)
     if cache_ok:
         features = np.load(feat_path)
         labels = np.load(label_path).tolist()
@@ -550,6 +689,8 @@ def main():
         np.save(label_path, np.asarray(labels))
         np.save(path_path, np.asarray(video_dirs))
 
+    fusion_history = None
+    selected_weights = None
     if args.use_dtcwt_dna:
         if f_dtcwt is None or f_dna is None:
             # Cache had CNN features but not handcrafted ones; compute now.
@@ -574,18 +715,43 @@ def main():
             np.save(dtcwt_path, f_dtcwt)
             np.save(dna_path, f_dna)
 
-        retrieval_features = weighted_fuse_features(
-            features, f_dtcwt, f_dna, args.w_cnn, args.w_dtcwt, args.w_dna
-        )
+        if args.optimize_fusion:
+            retrieval_features, selected_weights, metrics, fusion_history = optimize_fusion_weights(
+                f_cnn=features,
+                f_dtcwt=f_dtcwt,
+                f_dna=f_dna,
+                labels=labels,
+                top_k=args.top_k,
+                num_samples=max(1, args.fusion_iters),
+                seed=args.fusion_seed,
+                target_metric=args.fusion_target,
+                fixed_weights=None,
+            )
+        else:
+            retrieval_features, selected_weights, metrics, fusion_history = optimize_fusion_weights(
+                f_cnn=features,
+                f_dtcwt=f_dtcwt,
+                f_dna=f_dna,
+                labels=labels,
+                top_k=args.top_k,
+                num_samples=1,
+                seed=args.fusion_seed,
+                target_metric=args.fusion_target,
+                fixed_weights=(args.w_cnn, args.w_dtcwt, args.w_dna),
+            )
     else:
         retrieval_features = features
-
-    metrics = compute_metrics(retrieval_features, labels, top_k=args.top_k)
+        metrics = compute_metrics(retrieval_features, labels, top_k=args.top_k)
     ks, precision_curve, recall_curve = compute_precision_recall_vs_k(
         retrieval_features, labels, max_k=args.max_k_curve
     )
     plot_precision_recall_vs_k(ks, precision_curve, recall_curve, args.curve_path)
     plot_precision_vs_recall(recall_curve, precision_curve, args.pr_curve_path)
+    plot_f1_vs_k(ks, precision_curve, recall_curve, args.f1_curve_path)
+    if fusion_history is not None:
+        plot_weight_search_history(
+            fusion_history["scores"], fusion_history["best_scores"], args.fusion_history_path
+        )
 
     print("KTH Retrieval Metrics")
     print(f"Videos: {len(labels)}")
@@ -594,11 +760,45 @@ def main():
     print(f"F1@{args.top_k}: {metrics['f1@k']:.4f}")
     print(f"mAP: {metrics['mAP']:.4f}")
     if args.use_dtcwt_dna:
-        w = np.asarray([args.w_cnn, args.w_dtcwt, args.w_dna], dtype=np.float32)
-        w = w / np.sum(w)
-        print(f"Fusion weights used (normalized): CNN={w[0]:.4f}, DTCWT={w[1]:.4f}, DNA={w[2]:.4f}")
+        if selected_weights is not None:
+            w = np.asarray(selected_weights, dtype=np.float32)
+            w = w / np.sum(w)
+            label = "Best fusion weights" if args.optimize_fusion else "Fusion weights used"
+            print(f"{label} (normalized): CNN={w[0]:.4f}, DTCWT={w[1]:.4f}, DNA={w[2]:.4f}")
+            if args.optimize_fusion:
+                print(f"Best iteration selected by: {args.fusion_target}")
     print(f"Precision/Recall vs K plot saved to: {args.curve_path}")
     print(f"Precision vs Recall plot saved to: {args.pr_curve_path}")
+    print(f"F1 vs K plot saved to: {args.f1_curve_path}")
+    if fusion_history is not None:
+        print(f"Fusion search history plot saved to: {args.fusion_history_path}")
+
+    # Log run details to Database folder for experiment tracking.
+    os.makedirs("Database", exist_ok=True)
+    log_path = os.path.join("Database", "cbir_run_log.txt")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write("-" * 80 + "\n")
+        f.write(f"Timestamp: {np.datetime64('now')}\n")
+        f.write(f"Model tag: {MODEL_TAG}\n")
+        f.write(f"Preprocess: {PREPROCESS_TAG}\n")
+        f.write(f"Input size: {args.input_size}\n")
+        f.write(f"Frames per video: {args.frames_per_video}\n")
+        f.write(f"Batch size: {args.batch_size}\n")
+        f.write(f"Person only: {args.person_only}\n")
+        f.write(f"Use DTCWT/DNA: {args.use_dtcwt_dna}\n")
+        f.write(f"Optimize fusion: {args.optimize_fusion}\n")
+        f.write(f"Fusion target: {args.fusion_target}\n")
+        f.write(f"Cache tag: {cache_tag}\n")
+        f.write(f"Force recompute: {force_recompute}\n")
+        f.write(f"Precision@{args.top_k}: {metrics['precision@k']:.4f}\n")
+        f.write(f"Recall@{args.top_k}: {metrics['recall@k']:.4f}\n")
+        f.write(f"F1@{args.top_k}: {metrics['f1@k']:.4f}\n")
+        f.write(f"mAP: {metrics['mAP']:.4f}\n")
+        if args.use_dtcwt_dna and selected_weights is not None:
+            w = np.asarray(selected_weights, dtype=np.float32)
+            w = w / np.sum(w)
+            f.write(f"Fusion weights (normalized): CNN={w[0]:.4f}, DTCWT={w[1]:.4f}, DNA={w[2]:.4f}\n")
+        f.write("\n")
 
 
 if __name__ == "__main__":
